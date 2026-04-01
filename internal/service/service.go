@@ -756,8 +756,7 @@ func (s *Service) applyUserUpdate(ctx context.Context, users []panel.User, newHa
 func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers []panel.User) {
 	switch action {
 	case "add":
-		// Defensive check for empty or nil deltaUsers
-		if deltaUsers == nil || len(deltaUsers) == 0 {
+		if len(deltaUsers) == 0 {
 			return
 		}
 		merged := mergeUsers(s.lastUsers, deltaUsers)
@@ -789,8 +788,7 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 		}
 
 	case "remove":
-		// Defensive check for empty or nil deltaUsers
-		if deltaUsers == nil || len(deltaUsers) == 0 {
+		if len(deltaUsers) == 0 {
 			return
 		}
 		filtered := subtractUsers(s.lastUsers, deltaUsers)
@@ -847,7 +845,7 @@ func subtractUsers(base, delta []panel.User) []panel.User {
 	if base == nil {
 		return nil
 	}
-	if delta == nil || len(delta) == 0 {
+	if len(delta) == 0 {
 		return base
 	}
 	removeSet := make(map[int]struct{}, len(delta))
