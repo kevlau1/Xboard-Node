@@ -143,6 +143,16 @@ func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination
 	if email != "" {
 		d.wrapLink(ctx, link, email, sourceIP, isTCP)
 	}
+
+	// Disable kernel-level splice so all traffic flows through our counting
+	// wrappers (statsCloseReader / statsCloseWriter). Without this, VLESS
+	// Vision on Linux uses splice to copy between file descriptors directly
+	// in kernel space, completely bypassing WriteMultiBuffer / ReadMultiBuffer
+	// and leaving download traffic uncounted.
+	if si := session.InboundFromContext(ctx); si != nil {
+		si.CanSpliceCopy = 3
+	}
+
 	return d.innerDisp.DispatchLink(ctx, dest, link)
 }
 
