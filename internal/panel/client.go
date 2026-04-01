@@ -102,7 +102,7 @@ func (c *Client) Report(traffic map[int][2]int64, alive map[int][]string, online
 		}()
 	}
 
-	if len(alive) > 0 {
+	if alive != nil {
 		a := aliveMapPool.Get().(map[string][]string)
 		for uid, ips := range alive {
 			a[strconv.Itoa(uid)] = ips

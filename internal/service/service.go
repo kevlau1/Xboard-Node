@@ -956,7 +956,7 @@ func (s *Service) pushReportAsync() {
 			if len(traffic) > 0 {
 				s.tracker.RestoreTraffic(traffic)
 			}
-			if len(aliveIPs) > 0 {
+			if aliveIPs != nil {
 				s.tracker.RestoreAliveIPs(aliveIPs)
 			}
 			s.pushBackoff.onFailure()
