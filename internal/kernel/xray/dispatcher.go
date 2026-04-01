@@ -96,11 +96,16 @@ type ipCounter struct {
 	ips   sync.Map     // sourceIP → *atomic.Int64 (refcount)
 }
 
-// aliveIPs returns a snapshot of distinct IPs.
+// aliveIPs returns a snapshot of distinct IPs that have active connections
+// (refcount > 0). IPs whose connections have all closed are excluded, which
+// prevents brief connections (e.g. latency tests) from inflating the alive
+// count when sampled between disconnect and sync.Map cleanup.
 func (ic *ipCounter) aliveIPs() map[string]bool {
 	result := make(map[string]bool)
-	ic.ips.Range(func(key, _ interface{}) bool {
-		result[key.(string)] = true
+	ic.ips.Range(func(key, value interface{}) bool {
+		if counter := value.(*atomic.Int64); counter.Load() > 0 {
+			result[key.(string)] = true
+		}
 		return true
 	})
 	return result
@@ -277,14 +282,19 @@ func (d *LimitDispatcher) GetUserTraffic() (traffic map[int][2]int64, aliveIPs m
 	aliveIPs = make(map[int]map[string]bool)
 
 	// Collect IPs from limited users (under RLock snapshot).
+	// Only include IPs with refcount > 0 (active connections) so that
+	// already-disconnected short-lived connections (latency tests) are
+	// not reported as alive.
 	for email, ipsMap := range limitedIPs {
 		uid := emailToUID[email]
 		if uid == 0 {
 			continue
 		}
 		ipSet := make(map[string]bool, len(ipsMap))
-		for ip := range ipsMap {
-			ipSet[ip] = true
+		for ip, refcount := range ipsMap {
+			if refcount > 0 {
+				ipSet[ip] = true
+			}
 		}
 		if len(ipSet) > 0 {
 			aliveIPs[uid] = ipSet
