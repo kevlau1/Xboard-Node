@@ -16,6 +16,7 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/pipe"
 	"golang.org/x/time/rate"
 
 	"github.com/cedar2025/xboard-node/internal/nlog"
@@ -518,6 +519,21 @@ func (r *statsCloseReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 
 func (r *statsCloseReader) Close() error { return common.Close(r.Reader) }
 func (r *statsCloseReader) Interrupt()   { common.Interrupt(r.Reader) }
+
+// ReturnAnError and Recover delegate to the underlying *pipe.Reader so that
+// xray-core's mux XUDP session close path (which needs these methods) works
+// correctly even though link.Reader has been wrapped.
+func (r *statsCloseReader) ReturnAnError(err error) {
+	if pr, ok := r.Reader.(*pipe.Reader); ok {
+		pr.ReturnAnError(err)
+	}
+}
+
+func (r *statsCloseReader) Recover() {
+	if pr, ok := r.Reader.(*pipe.Reader); ok {
+		pr.Recover()
+	}
+}
 
 type statsCloseWriter struct {
 	buf.Writer
