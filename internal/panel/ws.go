@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/url"
+	"sort"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -405,7 +406,7 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 	case WSEventSyncDevices:
 		nlog.Core().Debug("ws sync devices event received")
 		var p syncDevicesPayload
-		if err := decodeData(msg.Data, &p); err != nil {
+		if err := decodeDevicesPayload(msg.Data, &p); err != nil {
 			nlog.Core().Warn("ws: cannot decode devices payload", "error", err)
 			return
 		}
@@ -437,6 +438,54 @@ func (w *WSClient) SendDeviceReport(devices map[int][]string) {
 	default:
 		nlog.Core().Warn("ws write channel full, skipping device report")
 	}
+}
+
+// decodeDevicesPayload handles the sync.devices payload where IP lists may arrive
+// as either JSON arrays (["ip1","ip2"]) or JSON objects ({"0":"ip1","2":"ip2"})
+// due to PHP's array_unique() preserving non-contiguous keys, which causes
+// json_encode to emit an object instead of an array.
+func decodeDevicesPayload(data []byte, p *syncDevicesPayload) error {
+	var raw struct {
+		Users     map[string]json.RawMessage `json:"users"`
+		Timestamp int64                      `json:"timestamp"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("unmarshal devices envelope: %w", err)
+	}
+	p.Timestamp = raw.Timestamp
+	p.Users = make(map[int][]string, len(raw.Users))
+
+	for k, v := range raw.Users {
+		uid, err := strconv.Atoi(k)
+		if err != nil {
+			continue
+		}
+
+		var ips []string
+		if err := json.Unmarshal(v, &ips); err == nil {
+			p.Users[uid] = ips
+			continue
+		}
+
+		// PHP array_unique() with non-contiguous keys encodes as {"0":"ip","2":"ip"}
+		var ipMap map[string]string
+		if err := json.Unmarshal(v, &ipMap); err == nil {
+			keys := make([]string, 0, len(ipMap))
+			for idx := range ipMap {
+				keys = append(keys, idx)
+			}
+			sort.Strings(keys)
+			ips = make([]string, 0, len(ipMap))
+			for _, idx := range keys {
+				ips = append(ips, ipMap[idx])
+			}
+			p.Users[uid] = ips
+			continue
+		}
+
+		nlog.Core().Warn("ws: skipping unparseable device entry", "user_id", k)
+	}
+	return nil
 }
 
 // SendRaw sends a raw message to the panel via WebSocket.

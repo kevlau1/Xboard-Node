@@ -231,6 +231,76 @@ func TestWSClient_FallbackWhenNoServer(t *testing.T) {
 	}
 }
 
+func TestDecodeDevicesPayload_ArrayFormat(t *testing.T) {
+	data := []byte(`{"users": {"15029": ["1.2.3.4", "5.6.7.8"], "18032": ["10.0.0.1"]}, "timestamp": 1234}`)
+	var p syncDevicesPayload
+	if err := decodeDevicesPayload(data, &p); err != nil {
+		t.Fatalf("decodeDevicesPayload failed: %v", err)
+	}
+	if len(p.Users) != 2 {
+		t.Fatalf("expected 2 users, got %d", len(p.Users))
+	}
+	if len(p.Users[15029]) != 2 {
+		t.Fatalf("expected 2 IPs for user 15029, got %d", len(p.Users[15029]))
+	}
+	if p.Users[15029][0] != "1.2.3.4" || p.Users[15029][1] != "5.6.7.8" {
+		t.Errorf("unexpected IPs for user 15029: %v", p.Users[15029])
+	}
+	if p.Users[18032][0] != "10.0.0.1" {
+		t.Errorf("unexpected IPs for user 18032: %v", p.Users[18032])
+	}
+	if p.Timestamp != 1234 {
+		t.Errorf("expected timestamp 1234, got %d", p.Timestamp)
+	}
+}
+
+func TestDecodeDevicesPayload_ObjectFormat(t *testing.T) {
+	// PHP array_unique() with non-contiguous keys produces JSON objects
+	data := []byte(`{"users": {"15029": {"0": "1.2.3.4", "1": "5.6.7.8", "3": "10.0.0.1"}, "18032": {"0": "192.168.1.1"}}, "timestamp": 5678}`)
+	var p syncDevicesPayload
+	if err := decodeDevicesPayload(data, &p); err != nil {
+		t.Fatalf("decodeDevicesPayload failed: %v", err)
+	}
+	if len(p.Users) != 2 {
+		t.Fatalf("expected 2 users, got %d", len(p.Users))
+	}
+	if len(p.Users[15029]) != 3 {
+		t.Fatalf("expected 3 IPs for user 15029, got %d", len(p.Users[15029]))
+	}
+	if p.Users[15029][0] != "1.2.3.4" || p.Users[15029][1] != "5.6.7.8" || p.Users[15029][2] != "10.0.0.1" {
+		t.Errorf("unexpected IPs for user 15029: %v", p.Users[15029])
+	}
+	if p.Users[18032][0] != "192.168.1.1" {
+		t.Errorf("unexpected IPs for user 18032: %v", p.Users[18032])
+	}
+}
+
+func TestDecodeDevicesPayload_EmptyUsers(t *testing.T) {
+	data := []byte(`{"users": {}, "timestamp": 0}`)
+	var p syncDevicesPayload
+	if err := decodeDevicesPayload(data, &p); err != nil {
+		t.Fatalf("decodeDevicesPayload failed: %v", err)
+	}
+	if len(p.Users) != 0 {
+		t.Fatalf("expected 0 users, got %d", len(p.Users))
+	}
+}
+
+func TestDecodeDevicesPayload_MixedFormats(t *testing.T) {
+	// Some users have arrays, others have objects
+	data := []byte(`{"users": {"100": ["1.1.1.1"], "200": {"0": "2.2.2.2", "2": "3.3.3.3"}}, "timestamp": 9999}`)
+	var p syncDevicesPayload
+	if err := decodeDevicesPayload(data, &p); err != nil {
+		t.Fatalf("decodeDevicesPayload failed: %v", err)
+	}
+	if len(p.Users[100]) != 1 || p.Users[100][0] != "1.1.1.1" {
+		t.Errorf("unexpected IPs for user 100: %v", p.Users[100])
+	}
+	if len(p.Users[200]) != 2 {
+		t.Fatalf("expected 2 IPs for user 200, got %d", len(p.Users[200]))
+	}
+}
+
 func TestWSClient_UserDeltaEvent(t *testing.T) {
 	deltaPayload := syncUserDeltaPayload{
 		Action:    "add",
