@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	_ "unsafe"
 
 	xrayDispatcher "github.com/xtls/xray-core/app/dispatcher"
@@ -82,6 +83,12 @@ type LimitDispatcher struct {
 	unlimitedIPs sync.Map // email → *ipCounter
 
 	connCount atomic.Int64 // total active connections tracked by dispatcher
+
+	// Multi-node global device state from panel (via sync.devices WS event).
+	// Maps userID → set of source IPs seen across ALL nodes.
+	globalDevices    map[int]map[string]bool
+	globalMu         sync.RWMutex
+	globalLastUpdate time.Time
 
 	// filterDomains holds lowercased destination domains whose connections
 	// should be excluded from device tracking (but still proxied normally).
@@ -210,6 +217,33 @@ func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits, 
 	d.mu.Unlock()
 }
 
+// UpdateGlobalDevices stores the aggregated device state pushed by the panel.
+// The data contains IPs from ALL nodes for each user, enabling cross-node
+// device limit enforcement.
+func (d *LimitDispatcher) UpdateGlobalDevices(users map[int][]string) {
+	d.globalMu.Lock()
+	d.globalDevices = make(map[int]map[string]bool, len(users))
+	for uid, ips := range users {
+		m := make(map[string]bool, len(ips))
+		for _, ip := range ips {
+			m[ip] = true
+		}
+		d.globalDevices[uid] = m
+	}
+	d.globalLastUpdate = time.Now()
+	d.globalMu.Unlock()
+	nlog.Core().Debug("xray: global device state updated", "users", len(users))
+}
+
+// ClearGlobalDevices resets global device state (called on WS disconnect).
+func (d *LimitDispatcher) ClearGlobalDevices() {
+	d.globalMu.Lock()
+	d.globalDevices = make(map[int]map[string]bool)
+	d.globalLastUpdate = time.Time{}
+	d.globalMu.Unlock()
+	nlog.Core().Debug("xray: global device state cleared")
+}
+
 // SetFilterDomains replaces the set of destination domains whose connections
 // are excluded from device tracking. Domains are matched case-insensitively
 // and support suffix matching (e.g. "gstatic.com" matches both
@@ -322,7 +356,8 @@ func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool
 
 // checkDeviceLimit enforces per-user device limits.
 // Fast path: unlimited users use lock-free sync.Map.
-// Slow path: limited users use RWMutex with deterministic IP ordering.
+// Slow path: limited users use RWMutex with deterministic IP ordering,
+// merging local IPs with global device state from the panel when fresh.
 func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) bool {
 	d.mu.RLock()
 	limit, hasLimit := d.deviceLimits[email]
@@ -333,17 +368,18 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) b
 		if isTCP {
 			v, _ := d.unlimitedIPs.LoadOrStore(email, &ipCounter{})
 			ic := v.(*ipCounter)
-
-			// Increment IP refcount atomically.
 			rv, _ := ic.ips.LoadOrStore(sourceIP, &atomic.Int64{})
 			rv.(*atomic.Int64).Add(1)
 		}
 		return false
 	}
 
-	// Slow path: user has device limit — need deterministic ordering.
+	// Slow path: user has device limit.
 	d.mu.RLock()
 	ips := d.limitedIPs[email]
+	uid := d.emailToUID[email]
+
+	// Already known locally → always allow.
 	if ips != nil && ips[sourceIP] > 0 {
 		d.mu.RUnlock()
 		if isTCP {
@@ -354,25 +390,36 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) b
 		return false
 	}
 
-	if ips != nil && len(ips) < limit {
-		d.mu.RUnlock()
-		if isTCP {
-			d.mu.Lock()
-			if d.limitedIPs[email] == nil {
-				d.limitedIPs[email] = make(map[string]int)
-			}
-			d.limitedIPs[email][sourceIP]++
-			d.mu.Unlock()
-		}
-		return false
+	localCount := 0
+	if ips != nil {
+		localCount = len(ips)
 	}
 	d.mu.RUnlock()
 
-	// Over limit — need write lock for deterministic check.
+	// Read global device state (separate lock, never held with mu).
+	var globalIPs map[string]bool
+	d.globalMu.RLock()
+	if time.Since(d.globalLastUpdate) <= 60*time.Second {
+		globalIPs = d.globalDevices[uid]
+	}
+	d.globalMu.RUnlock()
+
+	// No fresh global data → local-only fast path.
+	if globalIPs == nil {
+		if localCount < limit {
+			d.addLimitedIP(email, sourceIP, isTCP)
+			return false
+		}
+	} else if globalIPs[sourceIP] {
+		// Known on another node → allow.
+		d.addLimitedIP(email, sourceIP, isTCP)
+		return false
+	}
+
+	// Final check under write lock with merged state.
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	// Re-check under write lock.
 	ips = d.limitedIPs[email]
 	if ips == nil {
 		ips = make(map[string]int)
@@ -386,16 +433,25 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) b
 		return false
 	}
 
-	if len(ips) < limit {
+	// Merge local + global IPs for the limit check.
+	allIPs := make(map[string]bool, len(ips)+len(globalIPs))
+	for ip := range ips {
+		allIPs[ip] = true
+	}
+	for ip := range globalIPs {
+		allIPs[ip] = true
+	}
+
+	if len(allIPs) < limit {
 		if isTCP {
 			ips[sourceIP]++
 		}
 		return false
 	}
 
-	// Over limit — deterministic: allow lowest IPs lexicographically.
-	ipList := make([]string, 0, len(ips)+1)
-	for ip := range ips {
+	// Over merged limit — deterministic: allow lowest IPs lexicographically.
+	ipList := make([]string, 0, len(allIPs)+1)
+	for ip := range allIPs {
 		ipList = append(ipList, ip)
 	}
 	ipList = append(ipList, sourceIP)
@@ -410,6 +466,19 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) b
 		}
 	}
 	return true
+}
+
+// addLimitedIP registers sourceIP for a limited user (TCP only).
+func (d *LimitDispatcher) addLimitedIP(email, sourceIP string, isTCP bool) {
+	if !isTCP {
+		return
+	}
+	d.mu.Lock()
+	if d.limitedIPs[email] == nil {
+		d.limitedIPs[email] = make(map[string]int)
+	}
+	d.limitedIPs[email][sourceIP]++
+	d.mu.Unlock()
 }
 
 // delConn decrements the IP refcount when a connection closes.

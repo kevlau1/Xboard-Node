@@ -268,11 +268,26 @@ func (x *Xray) SetSpeedLimitFunc(fn func(string) *rate.Limiter) {
 // gate-kept by LimitDispatcher.checkDeviceLimit at Dispatch time.
 func (x *Xray) SetDeviceLimitFunc(_ func(string) (int, bool)) {}
 
-// UpdateGlobalDevices is a no-op for xray — xray handles device limits differently.
-func (x *Xray) UpdateGlobalDevices(_ map[int][]string) {}
+// UpdateGlobalDevices forwards the panel's aggregated device state to the
+// LimitDispatcher for cross-node device limit enforcement.
+func (x *Xray) UpdateGlobalDevices(users map[int][]string) {
+	x.mu.Lock()
+	ld := x.limitDispatcher
+	x.mu.Unlock()
+	if ld != nil {
+		ld.UpdateGlobalDevices(users)
+	}
+}
 
-// ClearGlobalDevices is a no-op for xray.
-func (x *Xray) ClearGlobalDevices() {}
+// ClearGlobalDevices clears the global device state (on WS disconnect).
+func (x *Xray) ClearGlobalDevices() {
+	x.mu.Lock()
+	ld := x.limitDispatcher
+	x.mu.Unlock()
+	if ld != nil {
+		ld.ClearGlobalDevices()
+	}
+}
 
 // ─── User management (non-disruptive where possible) ────────────────────────
 

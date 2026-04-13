@@ -3,6 +3,7 @@ package xray
 import (
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/xtls/xray-core/common/buf"
@@ -267,6 +268,187 @@ func TestLimitDispatcher_FilterDomainEmptyList(t *testing.T) {
 	}
 	if ld.isFilteredDomain(dest) {
 		t.Error("empty filter list should not filter anything")
+	}
+}
+
+// ─── Global device limit tests ──────────────────────────────────────────────
+
+func TestGlobalDevices_MergedLimitCheck(t *testing.T) {
+	ld := newTestDispatcher()
+
+	email := userEmail(1)
+	ld.UpdateLimits(map[string]int{email: 1}, map[string]int{email: 3}, nil)
+
+	// Local: 1.1.1.1
+	if ld.checkDeviceLimit(email, "1.1.1.1", true) {
+		t.Fatal("first local IP should be allowed")
+	}
+
+	// Global state: user 1 has 2.2.2.2 and 3.3.3.3 from other nodes
+	ld.UpdateGlobalDevices(map[int][]string{
+		1: {"2.2.2.2", "3.3.3.3"},
+	})
+
+	// local(1) + global(2) = 3 = limit, new IP 4.4.4.4 should be rejected
+	if !ld.checkDeviceLimit(email, "4.4.4.4", true) {
+		t.Error("4th IP should be rejected (local=1 + global=2 = 3 = limit)")
+	}
+
+	// IP already local should still be allowed
+	if ld.checkDeviceLimit(email, "1.1.1.1", true) {
+		t.Error("already-local IP should always be allowed")
+	}
+}
+
+func TestGlobalDevices_GlobalIPAllowed(t *testing.T) {
+	ld := newTestDispatcher()
+
+	email := userEmail(1)
+	ld.UpdateLimits(map[string]int{email: 1}, map[string]int{email: 2}, nil)
+
+	// Local: 1.1.1.1
+	if ld.checkDeviceLimit(email, "1.1.1.1", true) {
+		t.Fatal("first local IP should be allowed")
+	}
+
+	// Global says this user also has 2.2.2.2 on another node
+	ld.UpdateGlobalDevices(map[int][]string{
+		1: {"1.1.1.1", "2.2.2.2"},
+	})
+
+	// 2.2.2.2 is already globally known → should be allowed even though
+	// local count would be at limit
+	if ld.checkDeviceLimit(email, "2.2.2.2", true) {
+		t.Error("globally known IP should be allowed")
+	}
+}
+
+func TestGlobalDevices_StaleDataFallsBackToLocal(t *testing.T) {
+	ld := newTestDispatcher()
+
+	email := userEmail(1)
+	ld.UpdateLimits(map[string]int{email: 1}, map[string]int{email: 2}, nil)
+
+	// Set global state and then make it stale
+	ld.UpdateGlobalDevices(map[int][]string{
+		1: {"9.9.9.9"},
+	})
+	ld.globalMu.Lock()
+	ld.globalLastUpdate = time.Now().Add(-120 * time.Second) // 2 minutes ago → stale
+	ld.globalMu.Unlock()
+
+	// Local: 1.1.1.1
+	if ld.checkDeviceLimit(email, "1.1.1.1", true) {
+		t.Fatal("first local IP should be allowed")
+	}
+
+	// With stale global, only local count matters; limit=2, local=1 → allow
+	if ld.checkDeviceLimit(email, "2.2.2.2", true) {
+		t.Error("with stale global data, should fallback to local-only; local=1 < limit=2")
+	}
+
+	// local=2 = limit → reject
+	if !ld.checkDeviceLimit(email, "3.3.3.3", true) {
+		t.Error("local=2 = limit, third IP should be rejected")
+	}
+}
+
+func TestGlobalDevices_ClearResetsState(t *testing.T) {
+	ld := newTestDispatcher()
+
+	email := userEmail(1)
+	ld.UpdateLimits(map[string]int{email: 1}, map[string]int{email: 2}, nil)
+
+	ld.UpdateGlobalDevices(map[int][]string{
+		1: {"9.9.9.9"},
+	})
+	ld.ClearGlobalDevices()
+
+	// After clear, global state should be gone → local only
+	if ld.checkDeviceLimit(email, "1.1.1.1", true) {
+		t.Fatal("first local IP should be allowed")
+	}
+	if ld.checkDeviceLimit(email, "2.2.2.2", true) {
+		t.Error("local=1 < limit=2, should be allowed after global clear")
+	}
+}
+
+func TestGlobalDevices_LexicographicSelection(t *testing.T) {
+	ld := newTestDispatcher()
+
+	email := userEmail(1)
+	ld.UpdateLimits(map[string]int{email: 1}, map[string]int{email: 2}, nil)
+
+	// Global has 5.5.5.5 from another node
+	ld.UpdateGlobalDevices(map[int][]string{
+		1: {"5.5.5.5"},
+	})
+
+	// Local: 3.3.3.3
+	if ld.checkDeviceLimit(email, "3.3.3.3", true) {
+		t.Fatal("first local IP should be allowed")
+	}
+
+	// merged = {3.3.3.3, 5.5.5.5} = 2 = limit
+	// New IP 1.1.1.1 → merged+new = {1.1.1.1, 3.3.3.3, 5.5.5.5}
+	// Lex sort → pick first 2: {1.1.1.1, 3.3.3.3}
+	// 1.1.1.1 is in allowed set → should be allowed
+	if ld.checkDeviceLimit(email, "1.1.1.1", true) {
+		t.Error("1.1.1.1 is lexicographically first, should be allowed")
+	}
+
+	// New IP 9.9.9.9 → merged+new = {1.1.1.1, 3.3.3.3, 5.5.5.5, 9.9.9.9}
+	// Lex sort → pick first 2: {1.1.1.1, 3.3.3.3}
+	// 9.9.9.9 is NOT in allowed set → should be rejected
+	if !ld.checkDeviceLimit(email, "9.9.9.9", true) {
+		t.Error("9.9.9.9 is lexicographically last, should be rejected")
+	}
+}
+
+func TestGlobalDevices_NoGlobalDataForUser(t *testing.T) {
+	ld := newTestDispatcher()
+
+	email := userEmail(1)
+	ld.UpdateLimits(map[string]int{email: 1}, map[string]int{email: 2}, nil)
+
+	// Global state exists but NOT for user 1
+	ld.UpdateGlobalDevices(map[int][]string{
+		999: {"8.8.8.8"},
+	})
+
+	// Should fallback to local-only
+	if ld.checkDeviceLimit(email, "1.1.1.1", true) {
+		t.Fatal("should be allowed (no global data for this user)")
+	}
+	if ld.checkDeviceLimit(email, "2.2.2.2", true) {
+		t.Error("should be allowed (local=1 < limit=2, no global data)")
+	}
+	if !ld.checkDeviceLimit(email, "3.3.3.3", true) {
+		t.Error("should be rejected (local=2 = limit)")
+	}
+}
+
+func TestGlobalDevices_UDPDoesNotChangeRefcount(t *testing.T) {
+	ld := newTestDispatcher()
+
+	email := userEmail(1)
+	ld.UpdateLimits(map[string]int{email: 1}, map[string]int{email: 2}, nil)
+
+	ld.UpdateGlobalDevices(map[int][]string{
+		1: {"5.5.5.5"},
+	})
+
+	// UDP check should not add to local state
+	if ld.checkDeviceLimit(email, "1.1.1.1", false) {
+		t.Fatal("UDP should be allowed")
+	}
+
+	// Verify no local IP was added
+	ld.mu.RLock()
+	localIPs := ld.limitedIPs[email]
+	ld.mu.RUnlock()
+	if localIPs != nil && len(localIPs) > 0 {
+		t.Error("UDP should not add IPs to local state")
 	}
 }
 
