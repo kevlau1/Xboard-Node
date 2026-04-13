@@ -166,6 +166,7 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, certFil
 
 	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
+	x.applyFilterDomains()
 
 	nlog.Core().Info("xray started",
 		"users", len(users),
@@ -799,6 +800,19 @@ func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
 	}
 
 	ld.UpdateLimits(emailToUID, deviceLimits, nil)
+}
+
+// applyFilterDomains pushes the configured device filter domains to the
+// LimitDispatcher so that connections to those domains are excluded from
+// device tracking.
+func (x *Xray) applyFilterDomains() {
+	x.mu.Lock()
+	ld := x.limitDispatcher
+	domains := x.cfg.DeviceFilterDomains
+	x.mu.Unlock()
+	if ld != nil && len(domains) > 0 {
+		ld.SetFilterDomains(domains)
+	}
 }
 
 // xrayCreationMu serialises xrayCore.New() + globalLimitDispatcher capture

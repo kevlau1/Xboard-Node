@@ -120,6 +120,13 @@ type KernelConfig struct {
 	// customization of dns, outbounds, endpoints, route, experimental, etc.
 	// Compatible with V2bX OriginalPath format.
 	CustomConfig string `yaml:"custom_config"`
+
+	// DeviceFilterDomains lists destination domains that should be excluded
+	// from device tracking (alive IP / device count). Connections to these
+	// domains still go through normally and traffic is still counted; only
+	// device/online metrics are skipped. Useful for filtering out proxy-app
+	// connectivity tests (e.g. cp.cloudflare.com, www.gstatic.com).
+	DeviceFilterDomains []string `yaml:"device_filter_domains"`
 }
 
 type CertConfig struct {

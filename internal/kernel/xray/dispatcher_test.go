@@ -6,6 +6,7 @@ import (
 
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport"
 )
 
@@ -202,6 +203,70 @@ func TestLimitDispatcher_TrackLinkPreservesReader(t *testing.T) {
 	}
 	if link.Writer == origWriter {
 		t.Fatal("trackLink should wrap link.Writer for lifecycle callbacks")
+	}
+}
+
+func TestLimitDispatcher_FilterDomains(t *testing.T) {
+	ld := newTestDispatcher()
+	ld.SetFilterDomains([]string{
+		"cp.cloudflare.com",
+		"gstatic.com",
+		"Speed.Cloudflare.Com", // case insensitive
+	})
+
+	tests := []struct {
+		domain   string
+		filtered bool
+	}{
+		{"cp.cloudflare.com", true},
+		{"CP.CLOUDFLARE.COM", true},                // case insensitive
+		{"www.gstatic.com", true},                   // suffix match
+		{"connectivitycheck.gstatic.com", true},     // suffix match
+		{"gstatic.com", true},                       // exact match
+		{"speed.cloudflare.com", true},              // case insensitive
+		{"www.youtube.com", false},                  // not filtered
+		{"cloudflare.com", false},                   // not a suffix of "cp.cloudflare.com"
+		{"fakegstatic.com", false},                  // not a suffix match (no dot boundary)
+		{"evil.cp.cloudflare.com", true},            // suffix match
+	}
+
+	for _, tc := range tests {
+		dest := net.Destination{
+			Address: net.DomainAddress(tc.domain),
+			Port:    443,
+			Network: net.Network_TCP,
+		}
+		got := ld.isFilteredDomain(dest)
+		if got != tc.filtered {
+			t.Errorf("isFilteredDomain(%q) = %v, want %v", tc.domain, got, tc.filtered)
+		}
+	}
+}
+
+func TestLimitDispatcher_FilterDomainIPNotFiltered(t *testing.T) {
+	ld := newTestDispatcher()
+	ld.SetFilterDomains([]string{"cp.cloudflare.com"})
+
+	dest := net.Destination{
+		Address: net.IPAddress([]byte{1, 1, 1, 1}),
+		Port:    443,
+		Network: net.Network_TCP,
+	}
+	if ld.isFilteredDomain(dest) {
+		t.Error("IP destinations should never be filtered")
+	}
+}
+
+func TestLimitDispatcher_FilterDomainEmptyList(t *testing.T) {
+	ld := newTestDispatcher()
+
+	dest := net.Destination{
+		Address: net.DomainAddress("cp.cloudflare.com"),
+		Port:    443,
+		Network: net.Network_TCP,
+	}
+	if ld.isFilteredDomain(dest) {
+		t.Error("empty filter list should not filter anything")
 	}
 }
 

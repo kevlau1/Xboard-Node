@@ -22,6 +22,18 @@ kernel:
   config_dir: "/etc/xboard-node"
   # Kernel log level: debug/info/warn/error (default: warn)
   log_level: "warn"
+  # Domains excluded from device tracking (alive IP / device count).
+  # Connections to these domains are proxied normally and traffic is still
+  # counted — only device/online metrics are skipped. Supports suffix
+  # matching: "gstatic.com" also matches "www.gstatic.com".
+  # Useful for filtering proxy-app connectivity tests.
+  # device_filter_domains:
+  #   - "cp.cloudflare.com"
+  #   - "gstatic.com"
+  #   - "speed.cloudflare.com"
+  #   - "captive.apple.com"
+  #   - "msftconnecttest.com"
+  #   - "detectportal.firefox.com"
 
 # TLS certificate settings
 # cert_mode: "http" | "dns" | "self" | "file" | "none"

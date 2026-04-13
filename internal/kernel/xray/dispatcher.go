@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	_ "unsafe"
@@ -81,6 +82,11 @@ type LimitDispatcher struct {
 	unlimitedIPs sync.Map // email → *ipCounter
 
 	connCount atomic.Int64 // total active connections tracked by dispatcher
+
+	// filterDomains holds lowercased destination domains whose connections
+	// should be excluded from device tracking (but still proxied normally).
+	filterMu      sync.RWMutex
+	filterDomains map[string]bool
 }
 
 // ipCounter tracks IPs for unlimited users without any lock.
@@ -142,6 +148,11 @@ func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destina
 	if si == nil || si.User == nil || len(si.User.Email) == 0 {
 		return "", "", false, nil
 	}
+
+	if d.isFilteredDomain(dest) {
+		return "", "", false, nil
+	}
+
 	email = si.User.Email
 	sourceIP = si.Source.Address.IP().String()
 	isTCP = dest.Network == net.Network_TCP
@@ -197,7 +208,50 @@ func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits, 
 	d.emailToUID = emailToUID
 	d.deviceLimits = deviceLimits
 	d.mu.Unlock()
+}
 
+// SetFilterDomains replaces the set of destination domains whose connections
+// are excluded from device tracking. Domains are matched case-insensitively
+// and support suffix matching (e.g. "gstatic.com" matches both
+// "www.gstatic.com" and "connectivitycheck.gstatic.com").
+func (d *LimitDispatcher) SetFilterDomains(domains []string) {
+	m := make(map[string]bool, len(domains))
+	for _, domain := range domains {
+		domain = strings.TrimSpace(strings.ToLower(domain))
+		if domain != "" {
+			m[domain] = true
+		}
+	}
+	d.filterMu.Lock()
+	d.filterDomains = m
+	d.filterMu.Unlock()
+	if len(m) > 0 {
+		nlog.Core().Info("xray: device filter domains configured", "count", len(m))
+	}
+}
+
+// isFilteredDomain returns true if the destination is a domain that should be
+// excluded from device tracking. Supports exact and suffix matching.
+func (d *LimitDispatcher) isFilteredDomain(dest net.Destination) bool {
+	if !dest.Address.Family().IsDomain() {
+		return false
+	}
+	d.filterMu.RLock()
+	domains := d.filterDomains
+	d.filterMu.RUnlock()
+	if len(domains) == 0 {
+		return false
+	}
+	host := strings.ToLower(dest.Address.Domain())
+	if domains[host] {
+		return true
+	}
+	for domain := range domains {
+		if strings.HasSuffix(host, "."+domain) {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *LimitDispatcher) ResetConns() {
