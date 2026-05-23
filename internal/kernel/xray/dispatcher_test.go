@@ -1,6 +1,8 @@
 package xray
 
 import (
+	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -8,18 +10,37 @@ import (
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/transport"
 )
 
 func newTestDispatcher() *LimitDispatcher {
 	return &LimitDispatcher{
-		limitedIPs: make(map[string]map[string]int),
+		limitedIPs:   make(map[string]map[string]int),
+		trackedConns: make(map[string]map[string]map[uint64]*closeTrackingWriter),
 	}
 }
 
 type nopReader struct{}
 
 func (nopReader) ReadMultiBuffer() (buf.MultiBuffer, error) { return nil, nil }
+
+type failingDispatcher struct{}
+
+func (failingDispatcher) Type() interface{} { return nil }
+
+func (failingDispatcher) Start() error { return nil }
+
+func (failingDispatcher) Close() error { return nil }
+
+func (failingDispatcher) Dispatch(context.Context, net.Destination) (*transport.Link, error) {
+	return nil, errors.New("dispatch failed")
+}
+
+func (failingDispatcher) DispatchLink(context.Context, net.Destination, *transport.Link) error {
+	return errors.New("dispatch failed")
+}
 
 func TestLimitDispatcher_DeviceLimitCheck(t *testing.T) {
 	ld := newTestDispatcher()
@@ -187,7 +208,6 @@ func TestLimitDispatcher_UnlimitedUserFastPath(t *testing.T) {
 	}
 }
 
-
 func TestLimitDispatcher_TrackLinkPreservesReader(t *testing.T) {
 	ld := newTestDispatcher()
 	email := userEmail(1)
@@ -220,15 +240,15 @@ func TestLimitDispatcher_FilterDomains(t *testing.T) {
 		filtered bool
 	}{
 		{"cp.cloudflare.com", true},
-		{"CP.CLOUDFLARE.COM", true},                // case insensitive
-		{"www.gstatic.com", true},                   // suffix match
-		{"connectivitycheck.gstatic.com", true},     // suffix match
-		{"gstatic.com", true},                       // exact match
-		{"speed.cloudflare.com", true},              // case insensitive
-		{"www.youtube.com", false},                  // not filtered
-		{"cloudflare.com", false},                   // not a suffix of "cp.cloudflare.com"
-		{"fakegstatic.com", false},                  // not a suffix match (no dot boundary)
-		{"evil.cp.cloudflare.com", true},            // suffix match
+		{"CP.CLOUDFLARE.COM", true},             // case insensitive
+		{"www.gstatic.com", true},               // suffix match
+		{"connectivitycheck.gstatic.com", true}, // suffix match
+		{"gstatic.com", true},                   // exact match
+		{"speed.cloudflare.com", true},          // case insensitive
+		{"www.youtube.com", false},              // not filtered
+		{"cloudflare.com", false},               // not a suffix of "cp.cloudflare.com"
+		{"fakegstatic.com", false},              // not a suffix match (no dot boundary)
+		{"evil.cp.cloudflare.com", true},        // suffix match
 	}
 
 	for _, tc := range tests {
@@ -323,6 +343,25 @@ func TestGlobalDevices_GlobalIPAllowed(t *testing.T) {
 	}
 }
 
+func TestGlobalDevices_GlobalOverflowKnownIPRejected(t *testing.T) {
+	ld := newTestDispatcher()
+
+	email := userEmail(1)
+	ld.UpdateLimits(map[string]int{email: 1}, map[string]int{email: 2}, nil)
+
+	ld.UpdateGlobalDevices(map[int][]string{
+		1: {"1.1.1.1", "2.2.2.2", "9.9.9.9"},
+	})
+
+	if !ld.checkDeviceLimit(email, "9.9.9.9", true) {
+		t.Error("globally known overflow IP should be rejected")
+	}
+
+	if ld.checkDeviceLimit(email, "1.1.1.1", true) {
+		t.Error("globally allowed IP should be accepted")
+	}
+}
+
 func TestGlobalDevices_StaleDataFallsBackToLocal(t *testing.T) {
 	ld := newTestDispatcher()
 
@@ -390,18 +429,18 @@ func TestGlobalDevices_LexicographicSelection(t *testing.T) {
 	}
 
 	// merged = {3.3.3.3, 5.5.5.5} = 2 = limit
-	// New IP 1.1.1.1 → merged+new = {1.1.1.1, 3.3.3.3, 5.5.5.5}
-	// Lex sort → pick first 2: {1.1.1.1, 3.3.3.3}
-	// 1.1.1.1 is in allowed set → should be allowed
-	if ld.checkDeviceLimit(email, "1.1.1.1", true) {
-		t.Error("1.1.1.1 is lexicographically first, should be allowed")
+	// New IPs are not allowed to replace existing IPs at admission time.
+	if !ld.checkDeviceLimit(email, "1.1.1.1", true) {
+		t.Error("new IP should be rejected when merged device set is already at limit")
 	}
 
-	// New IP 9.9.9.9 → merged+new = {1.1.1.1, 3.3.3.3, 5.5.5.5, 9.9.9.9}
-	// Lex sort → pick first 2: {1.1.1.1, 3.3.3.3}
-	// 9.9.9.9 is NOT in allowed set → should be rejected
+	// Existing global/local IPs inside the allow-list should still be accepted.
+	if ld.checkDeviceLimit(email, "5.5.5.5", true) {
+		t.Error("existing global IP should be allowed")
+	}
+
 	if !ld.checkDeviceLimit(email, "9.9.9.9", true) {
-		t.Error("9.9.9.9 is lexicographically last, should be rejected")
+		t.Error("new IP should be rejected when merged device set is already at limit")
 	}
 }
 
@@ -447,7 +486,7 @@ func TestGlobalDevices_UDPDoesNotChangeRefcount(t *testing.T) {
 	ld.mu.RLock()
 	localIPs := ld.limitedIPs[email]
 	ld.mu.RUnlock()
-	if localIPs != nil && len(localIPs) > 0 {
+	if len(localIPs) > 0 {
 		t.Error("UDP should not add IPs to local state")
 	}
 }
@@ -478,5 +517,102 @@ func TestLimitDispatcher_CloseTrackingWriterReleasesConn(t *testing.T) {
 	}
 	if ld.checkDeviceLimit(email, "2.2.2.2", true) {
 		t.Fatal("device slot should be released after writer close")
+	}
+}
+
+func TestLimitDispatcher_DispatchLinkErrorReleasesTrackedConn(t *testing.T) {
+	ld := newTestDispatcher()
+	ld.innerDisp = failingDispatcher{}
+
+	email := userEmail(1)
+	ld.UpdateLimits(map[string]int{email: 1}, map[string]int{email: 1}, nil)
+
+	ctx := session.ContextWithInbound(context.Background(), &session.Inbound{
+		Source: net.TCPDestination(net.IPAddress([]byte{1, 1, 1, 1}), 12345),
+		User:   &protocol.MemoryUser{Email: email},
+	})
+	dest := net.TCPDestination(net.DomainAddress("example.com"), 443)
+	link := &transport.Link{Reader: nopReader{}, Writer: buf.Discard}
+
+	if err := ld.DispatchLink(ctx, dest, link); err == nil {
+		t.Fatal("DispatchLink should return inner dispatcher error")
+	}
+	if got := ld.connCount.Load(); got != 0 {
+		t.Fatalf("expected connCount=0 after DispatchLink error, got %d", got)
+	}
+	if ld.checkDeviceLimit(email, "2.2.2.2", true) {
+		t.Fatal("device slot should be released after DispatchLink error")
+	}
+}
+
+func TestLimitDispatcher_EnforceDeviceLimitInterruptsOverflowConnections(t *testing.T) {
+	ld := newTestDispatcher()
+	email := userEmail(1)
+	ld.UpdateLimits(map[string]int{email: 1}, map[string]int{email: 1}, nil)
+
+	if ld.checkDeviceLimit(email, "9.9.9.9", true) {
+		t.Fatal("initial local connection should be allowed before global state")
+	}
+
+	link := &transport.Link{Reader: nopReader{}, Writer: buf.Discard}
+	ld.trackLink(link, email, "9.9.9.9", true)
+
+	writer, ok := link.Writer.(*closeTrackingWriter)
+	if !ok {
+		t.Fatal("expected closeTrackingWriter wrapper")
+	}
+
+	ld.UpdateGlobalDevices(map[int][]string{
+		1: {"1.1.1.1", "9.9.9.9"},
+	})
+
+	if !writer.closed.Load() {
+		t.Fatal("overflow connection should be interrupted after global sync")
+	}
+	if got := ld.connCount.Load(); got != 0 {
+		t.Fatalf("expected connCount=0 after enforcement, got %d", got)
+	}
+
+	ld.mu.RLock()
+	localCount := len(ld.limitedIPs[email])
+	trackedCount := 0
+	if ipConns := ld.trackedConns[email]; ipConns != nil {
+		for _, conns := range ipConns {
+			trackedCount += len(conns)
+		}
+	}
+	ld.mu.RUnlock()
+
+	if localCount != 0 {
+		t.Fatalf("expected overflow IP to be removed from local state, got %d IPs", localCount)
+	}
+	if trackedCount != 0 {
+		t.Fatalf("expected tracked connection to be removed, got %d", trackedCount)
+	}
+}
+
+func TestLimitDispatcher_EnforceDeviceLimitRemovesStaleLimitedIPs(t *testing.T) {
+	ld := newTestDispatcher()
+	email := userEmail(1)
+	ld.UpdateLimits(map[string]int{email: 1}, map[string]int{email: 1}, nil)
+
+	ld.mu.Lock()
+	ld.limitedIPs[email] = map[string]int{"9.9.9.9": 1}
+	ld.mu.Unlock()
+
+	ld.UpdateGlobalDevices(map[int][]string{
+		1: {"1.1.1.1", "9.9.9.9"},
+	})
+
+	ld.mu.RLock()
+	_, stillPresent := ld.limitedIPs[email]["9.9.9.9"]
+	localCount := len(ld.limitedIPs[email])
+	ld.mu.RUnlock()
+
+	if stillPresent {
+		t.Fatal("expected overflow IP without tracked connection to be removed from local state")
+	}
+	if localCount != 0 {
+		t.Fatalf("expected no limited IPs after stale cleanup, got %d", localCount)
 	}
 }

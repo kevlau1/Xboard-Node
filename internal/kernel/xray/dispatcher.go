@@ -51,9 +51,10 @@ func limitDispatcherFactory(ctx context.Context, config interface{}) (interface{
 		return orig, nil
 	}
 	ld := &LimitDispatcher{
-		inner:      orig,
-		innerDisp:  inner,
-		limitedIPs: make(map[string]map[string]int),
+		inner:        orig,
+		innerDisp:    inner,
+		limitedIPs:   make(map[string]map[string]int),
+		trackedConns: make(map[string]map[string]map[uint64]*closeTrackingWriter),
 	}
 	globalLimitDispatcher.Store(ld)
 	nlog.Core().Debug("xray: limit dispatcher installed")
@@ -77,6 +78,8 @@ type LimitDispatcher struct {
 	limitedIPs   map[string]map[string]int // email → sourceIP → refcount
 	deviceLimits map[string]int            // email → max devices
 	emailToUID   map[string]int            // email → panel user ID
+	trackedConns map[string]map[string]map[uint64]*closeTrackingWriter
+	connSeq      atomic.Uint64
 
 	// unlimitedIPs: users without device limit — sync.Map for lock-free access.
 	// Each entry is *ipCounter{ips sync.Map}.
@@ -144,7 +147,14 @@ func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination
 	if email != "" {
 		d.trackLink(link, email, sourceIP, isTCP)
 	}
-	return d.innerDisp.DispatchLink(ctx, dest, link)
+	err = d.innerDisp.DispatchLink(ctx, dest, link)
+	if err != nil {
+		if writer, ok := link.Writer.(*closeTrackingWriter); ok {
+			writer.Interrupt()
+		}
+		return err
+	}
+	return nil
 }
 
 // identifyAndCheck extracts user identity from the session context, enforces
@@ -171,22 +181,28 @@ func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destina
 	return email, sourceIP, isTCP, nil
 }
 
-// trackLink records connection lifecycle without mutating xray-core owned
-// transport primitives. This keeps mux/XUDP compatible while still allowing
-// the dispatcher to release device-limit state when the link closes.
+// trackLink records connection lifecycle by wrapping Writer only. Reader stays
+// untouched because mux/XUDP close paths require the original concrete reader.
 func (d *LimitDispatcher) trackLink(link *transport.Link, email, sourceIP string, isTCP bool) {
 	d.connCount.Add(1)
+	connID := d.connSeq.Add(1)
 
 	onClose := func() {
 		if isTCP {
+			d.unregisterTrackedConn(email, sourceIP, connID)
 			d.delConn(email, sourceIP)
 		}
 		d.connCount.Add(-1)
 	}
 
-	link.Writer = &closeTrackingWriter{
+	writer := &closeTrackingWriter{
 		Writer:  link.Writer,
 		onClose: onClose,
+	}
+	link.Writer = writer
+
+	if isTCP {
+		d.registerTrackedConn(email, sourceIP, connID, writer)
 	}
 }
 
@@ -215,6 +231,7 @@ func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits, 
 	d.emailToUID = emailToUID
 	d.deviceLimits = deviceLimits
 	d.mu.Unlock()
+	d.enforceDeviceLimits()
 }
 
 // UpdateGlobalDevices stores the aggregated device state pushed by the panel.
@@ -233,6 +250,7 @@ func (d *LimitDispatcher) UpdateGlobalDevices(users map[int][]string) {
 	d.globalLastUpdate = time.Now()
 	d.globalMu.Unlock()
 	nlog.Core().Debug("xray: global device state updated", "users", len(users))
+	d.enforceDeviceLimits()
 }
 
 // ClearGlobalDevices resets global device state (called on WS disconnect).
@@ -291,6 +309,7 @@ func (d *LimitDispatcher) isFilteredDomain(dest net.Destination) bool {
 func (d *LimitDispatcher) ResetConns() {
 	d.mu.Lock()
 	d.limitedIPs = make(map[string]map[string]int)
+	d.trackedConns = make(map[string]map[string]map[uint64]*closeTrackingWriter)
 	d.mu.Unlock()
 
 	// Clear unlimited IPs
@@ -306,8 +325,22 @@ func (d *LimitDispatcher) ResetConns() {
 // Traffic bytes are intentionally left to xray's built-in stats pipeline.
 func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool, connCount int) {
 	d.mu.RLock()
-	emailToUID := d.emailToUID
-	limitedIPs := d.limitedIPs
+	emailToUID := make(map[string]int, len(d.emailToUID))
+	for email, uid := range d.emailToUID {
+		emailToUID[email] = uid
+	}
+	limitedIPs := make(map[string]map[string]bool, len(d.limitedIPs))
+	for email, ipsMap := range d.limitedIPs {
+		ipSet := make(map[string]bool, len(ipsMap))
+		for ip, count := range ipsMap {
+			if count > 0 {
+				ipSet[ip] = true
+			}
+		}
+		if len(ipSet) > 0 {
+			limitedIPs[email] = ipSet
+		}
+	}
 	d.mu.RUnlock()
 
 	aliveIPs = make(map[int]map[string]bool)
@@ -318,13 +351,7 @@ func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool
 		if uid == 0 {
 			continue
 		}
-		ipSet := make(map[string]bool, len(ipsMap))
-		for ip := range ipsMap {
-			ipSet[ip] = true
-		}
-		if len(ipSet) > 0 {
-			aliveIPs[uid] = ipSet
-		}
+		aliveIPs[uid] = ipsMap
 	}
 
 	// Collect IPs from unlimited users (lock-free).
@@ -361,10 +388,11 @@ func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool
 func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) bool {
 	d.mu.RLock()
 	limit, hasLimit := d.deviceLimits[email]
-	d.mu.RUnlock()
+	uid := d.emailToUID[email]
 
 	// Fast path: no device limit — use lock-free sync.Map.
 	if !hasLimit || limit <= 0 {
+		d.mu.RUnlock()
 		if isTCP {
 			v, _ := d.unlimitedIPs.LoadOrStore(email, &ipCounter{})
 			ic := v.(*ipCounter)
@@ -374,25 +402,12 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) b
 		return false
 	}
 
-	// Slow path: user has device limit.
-	d.mu.RLock()
 	ips := d.limitedIPs[email]
-	uid := d.emailToUID[email]
-
-	// Already known locally → always allow.
-	if ips != nil && ips[sourceIP] > 0 {
-		d.mu.RUnlock()
-		if isTCP {
-			d.mu.Lock()
-			d.limitedIPs[email][sourceIP]++
-			d.mu.Unlock()
+	localIPs := make(map[string]bool, len(ips))
+	for ip, count := range ips {
+		if count > 0 {
+			localIPs[ip] = true
 		}
-		return false
-	}
-
-	localCount := 0
-	if ips != nil {
-		localCount = len(ips)
 	}
 	d.mu.RUnlock()
 
@@ -400,70 +415,42 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) b
 	var globalIPs map[string]bool
 	d.globalMu.RLock()
 	if time.Since(d.globalLastUpdate) <= 60*time.Second {
-		globalIPs = d.globalDevices[uid]
+		if ips := d.globalDevices[uid]; ips != nil {
+			globalIPs = make(map[string]bool, len(ips))
+			for ip := range ips {
+				globalIPs[ip] = true
+			}
+		}
 	}
 	d.globalMu.RUnlock()
 
-	// No fresh global data → local-only fast path.
-	if globalIPs == nil {
-		if localCount < limit {
+	// Fresh global data is authoritative. All nodes compute the same
+	// deterministic allow-list and reject IPs outside it, even if that IP was
+	// previously known globally.
+	if globalIPs != nil {
+		allIPs := mergeIPSets(localIPs, globalIPs)
+		if allIPs[sourceIP] {
+			if !isIPAllowed(allIPs, sourceIP, limit) {
+				return true
+			}
 			d.addLimitedIP(email, sourceIP, isTCP)
 			return false
 		}
-	} else if globalIPs[sourceIP] {
-		// Known on another node → allow.
+		if len(allIPs) >= limit {
+			return true
+		}
 		d.addLimitedIP(email, sourceIP, isTCP)
 		return false
 	}
 
-	// Final check under write lock with merged state.
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	ips = d.limitedIPs[email]
-	if ips == nil {
-		ips = make(map[string]int)
-		d.limitedIPs[email] = ips
-	}
-
-	if ips[sourceIP] > 0 {
-		if isTCP {
-			ips[sourceIP]++
-		}
+	// No fresh global data → local-only check.
+	if localIPs[sourceIP] {
+		d.addLimitedIP(email, sourceIP, isTCP)
 		return false
 	}
-
-	// Merge local + global IPs for the limit check.
-	allIPs := make(map[string]bool, len(ips)+len(globalIPs))
-	for ip := range ips {
-		allIPs[ip] = true
-	}
-	for ip := range globalIPs {
-		allIPs[ip] = true
-	}
-
-	if len(allIPs) < limit {
-		if isTCP {
-			ips[sourceIP]++
-		}
+	if len(localIPs) < limit {
+		d.addLimitedIP(email, sourceIP, isTCP)
 		return false
-	}
-
-	// Over merged limit — deterministic: allow lowest IPs lexicographically.
-	ipList := make([]string, 0, len(allIPs)+1)
-	for ip := range allIPs {
-		ipList = append(ipList, ip)
-	}
-	ipList = append(ipList, sourceIP)
-	sort.Strings(ipList)
-
-	for i := 0; i < limit && i < len(ipList); i++ {
-		if ipList[i] == sourceIP {
-			if isTCP {
-				ips[sourceIP]++
-			}
-			return false
-		}
 	}
 	return true
 }
@@ -474,6 +461,9 @@ func (d *LimitDispatcher) addLimitedIP(email, sourceIP string, isTCP bool) {
 		return
 	}
 	d.mu.Lock()
+	if d.limitedIPs == nil {
+		d.limitedIPs = make(map[string]map[string]int)
+	}
 	if d.limitedIPs[email] == nil {
 		d.limitedIPs[email] = make(map[string]int)
 	}
@@ -507,6 +497,196 @@ func (d *LimitDispatcher) delConn(email, sourceIP string) {
 			delete(d.limitedIPs, email)
 		}
 	}
+}
+
+func (d *LimitDispatcher) registerTrackedConn(email, sourceIP string, connID uint64, writer *closeTrackingWriter) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.trackedConns == nil {
+		d.trackedConns = make(map[string]map[string]map[uint64]*closeTrackingWriter)
+	}
+	if d.trackedConns[email] == nil {
+		d.trackedConns[email] = make(map[string]map[uint64]*closeTrackingWriter)
+	}
+	if d.trackedConns[email][sourceIP] == nil {
+		d.trackedConns[email][sourceIP] = make(map[uint64]*closeTrackingWriter)
+	}
+	d.trackedConns[email][sourceIP][connID] = writer
+}
+
+func (d *LimitDispatcher) unregisterTrackedConn(email, sourceIP string, connID uint64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	ipConns := d.trackedConns[email]
+	if ipConns == nil {
+		return
+	}
+	conns := ipConns[sourceIP]
+	if conns == nil {
+		return
+	}
+	delete(conns, connID)
+	if len(conns) == 0 {
+		delete(ipConns, sourceIP)
+	}
+	if len(ipConns) == 0 {
+		delete(d.trackedConns, email)
+	}
+}
+
+func (d *LimitDispatcher) enforceDeviceLimits() {
+	globalDevices, hasFreshGlobal := d.globalDeviceSnapshot()
+
+	var victims []*closeTrackingWriter
+	staleRemovals := make(map[string][]string)
+	overflowIPs := 0
+
+	d.mu.RLock()
+	for email, limit := range d.deviceLimits {
+		if limit <= 0 {
+			continue
+		}
+
+		limitedIPs := d.limitedIPs[email]
+		ipConns := d.trackedConns[email]
+		if len(limitedIPs) == 0 && len(ipConns) == 0 {
+			continue
+		}
+
+		localIPs := make(map[string]bool, len(limitedIPs)+len(ipConns))
+		for ip, count := range limitedIPs {
+			if count > 0 {
+				localIPs[ip] = true
+			}
+		}
+		for ip := range ipConns {
+			localIPs[ip] = true
+		}
+
+		candidateIPs := localIPs
+		if hasFreshGlobal {
+			uid := d.emailToUID[email]
+			candidateIPs = mergeIPSets(candidateIPs, globalDevices[uid])
+		}
+		if len(candidateIPs) <= limit {
+			continue
+		}
+
+		allowed := firstNAllowedIPs(candidateIPs, limit)
+		for ip := range localIPs {
+			if allowed[ip] {
+				continue
+			}
+			overflowIPs++
+			if conns := ipConns[ip]; len(conns) > 0 {
+				for _, writer := range conns {
+					victims = append(victims, writer)
+				}
+			}
+			if limitedIPs[ip] > 0 {
+				staleRemovals[email] = append(staleRemovals[email], ip)
+			}
+		}
+	}
+	d.mu.RUnlock()
+
+	if len(staleRemovals) > 0 {
+		d.mu.Lock()
+		for email, ips := range staleRemovals {
+			for _, ip := range ips {
+				if current := d.limitedIPs[email]; current != nil {
+					delete(current, ip)
+					if len(current) == 0 {
+						delete(d.limitedIPs, email)
+					}
+				}
+			}
+		}
+		d.mu.Unlock()
+	}
+
+	for _, writer := range victims {
+		writer.Interrupt()
+	}
+
+	if len(victims) > 0 || len(staleRemovals) > 0 {
+		nlog.Core().Info("xray: device limit enforced, kicked overflow connections",
+			"connections", len(victims), "ips", overflowIPs, "stale_ips", countStaleRemovals(staleRemovals))
+	}
+}
+
+func countStaleRemovals(m map[string][]string) int {
+	total := 0
+	for _, ips := range m {
+		total += len(ips)
+	}
+	return total
+}
+
+func (d *LimitDispatcher) globalDeviceSnapshot() (map[int]map[string]bool, bool) {
+	d.globalMu.RLock()
+	defer d.globalMu.RUnlock()
+
+	if d.globalLastUpdate.IsZero() || time.Since(d.globalLastUpdate) > 60*time.Second {
+		return nil, false
+	}
+
+	result := make(map[int]map[string]bool, len(d.globalDevices))
+	for uid, ips := range d.globalDevices {
+		copied := make(map[string]bool, len(ips))
+		for ip := range ips {
+			copied[ip] = true
+		}
+		result[uid] = copied
+	}
+	return result, true
+}
+
+func mergeIPSets(sets ...map[string]bool) map[string]bool {
+	total := 0
+	for _, set := range sets {
+		total += len(set)
+	}
+	result := make(map[string]bool, total)
+	for _, set := range sets {
+		for ip := range set {
+			result[ip] = true
+		}
+	}
+	return result
+}
+
+func isIPAllowed(ips map[string]bool, sourceIP string, limit int) bool {
+	if limit <= 0 {
+		return false
+	}
+	if len(ips) <= limit {
+		return true
+	}
+	return firstNAllowedIPs(ips, limit)[sourceIP]
+}
+
+func firstNAllowedIPs(ips map[string]bool, limit int) map[string]bool {
+	if limit <= 0 {
+		return map[string]bool{}
+	}
+
+	ipList := make([]string, 0, len(ips))
+	for ip := range ips {
+		ipList = append(ipList, ip)
+	}
+	sort.Strings(ipList)
+
+	if limit > len(ipList) {
+		limit = len(ipList)
+	}
+	allowed := make(map[string]bool, limit)
+	for i := 0; i < limit; i++ {
+		allowed[ipList[i]] = true
+	}
+	return allowed
 }
 
 type closeTrackingWriter struct {
