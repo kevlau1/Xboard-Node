@@ -13,6 +13,9 @@ panel:
   token: "your-server-token"
   # Node ID as configured in the panel
   node_id: 1
+  # Limit panel HTTPS/WSS client TLS. Empty / "1.3" = Go default.
+  # Set "1.2" if TLS 1.3 ClientHello to the panel is dropped on this path.
+  # tls_max_version: "1.2"
 
 # Kernel settings (used by both panel mode and standalone mode)
 kernel:

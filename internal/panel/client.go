@@ -2,6 +2,7 @@ package panel
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -40,8 +41,19 @@ type Client struct {
 	apiFailure atomic.Uint64
 }
 
+func panelTLSClientConfig(cfg config.PanelConfig) *tls.Config {
+	max := cfg.TLSClientMaxVersion()
+	if max == 0 {
+		return nil
+	}
+	return &tls.Config{MaxVersion: max}
+}
+
 // NewClient creates a new panel API client
 func NewClient(cfg config.PanelConfig) *Client {
+	if cfg.TLSClientMaxVersion() == tls.VersionTLS12 {
+		nlog.Core().Info("panel HTTP client forcing TLS 1.2")
+	}
 	return &Client{
 		baseURL:  strings.TrimRight(cfg.URL, "/"),
 		token:    cfg.Token,
@@ -53,6 +65,7 @@ func NewClient(cfg config.PanelConfig) *Client {
 				MaxIdleConns:        10,
 				MaxIdleConnsPerHost: 10,
 				IdleConnTimeout:     90 * time.Second,
+				TLSClientConfig:     panelTLSClientConfig(cfg),
 			},
 		},
 	}

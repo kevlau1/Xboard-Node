@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/tls"
 	"os"
 	"path/filepath"
 	"testing"
@@ -321,5 +322,35 @@ kernel:
 	_, err := Load(path)
 	if err == nil {
 		t.Fatal("expected error for standalone mode without users")
+	}
+}
+
+func TestLoad_TLSMaxVersion12(t *testing.T) {
+	path := writeTemp(t, `
+panel:
+  url: "https://panel.example.com"
+  token: "tok"
+  node_id: 1
+  tls_max_version: "1.2"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Panel.TLSClientMaxVersion() != tls.VersionTLS12 {
+		t.Fatalf("TLSClientMaxVersion: got %d", cfg.Panel.TLSClientMaxVersion())
+	}
+}
+
+func TestLoad_TLSMaxVersionInvalid(t *testing.T) {
+	path := writeTemp(t, `
+panel:
+  url: "https://panel.example.com"
+  token: "tok"
+  node_id: 1
+  tls_max_version: "1.1"
+`)
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected error for tls_max_version 1.1")
 	}
 }

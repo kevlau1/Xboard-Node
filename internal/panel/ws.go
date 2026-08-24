@@ -2,6 +2,7 @@ package panel
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -77,6 +78,7 @@ type WSClientConfig struct {
 	HandshakeTimeout time.Duration
 	BackoffInitial   time.Duration
 	BackoffMax       time.Duration
+	TLSMaxVersion    uint16
 }
 
 // WSClient connects to the panel's Workerman WS server using native WebSocket.
@@ -197,6 +199,9 @@ func (w *WSClient) connect(ctx context.Context) error {
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: w.cfg.HandshakeTimeout,
+	}
+	if w.cfg.TLSMaxVersion != 0 {
+		dialer.TLSClientConfig = &tls.Config{MaxVersion: w.cfg.TLSMaxVersion}
 	}
 	conn, _, err := dialer.DialContext(ctx, u.String(), nil)
 	if err != nil {

@@ -117,6 +117,7 @@ func (p *PanelControlPlane) newPushClient(metricsFn func() map[string]interface{
 		HandshakeTimeout: time.Duration(p.wsCfg.HandshakeTimeout) * time.Second,
 		BackoffInitial:   time.Duration(p.wsCfg.BackoffInitial) * time.Second,
 		BackoffMax:       time.Duration(p.wsCfg.BackoffMax) * time.Second,
+		TLSMaxVersion:    p.cfg.TLSClientMaxVersion(),
 	}
 	inner := panel.NewWSClient(
 		wsURL,

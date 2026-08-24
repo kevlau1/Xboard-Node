@@ -1,12 +1,14 @@
 package config
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/cedar2025/xboard-node/internal/nlog"
 	"golang.org/x/term"
@@ -77,6 +79,21 @@ type PanelConfig struct {
 	Token    string `yaml:"token"`
 	NodeID   int    `yaml:"node_id"`
 	NodeType string `yaml:"node_type"`
+	// TLSMaxVersion limits the panel HTTPS/WSS client. Empty or "1.3" uses Go
+	// defaults. Set to "1.2" when the path to the panel drops TLS 1.3 ClientHello
+	// (SNI interference) while TLS 1.2 still works.
+	TLSMaxVersion string `yaml:"tls_max_version"`
+}
+
+// TLSClientMaxVersion returns a crypto/tls version constant, or 0 to leave
+// the Go default (currently TLS 1.3).
+func (p PanelConfig) TLSClientMaxVersion() uint16 {
+	switch strings.ToLower(strings.TrimSpace(p.TLSMaxVersion)) {
+	case "1.2", "tls1.2", "tlsv1.2":
+		return tls.VersionTLS12
+	default:
+		return 0
+	}
 }
 
 type NodeConfig struct {
@@ -234,6 +251,9 @@ func (c *Config) applyEnvOverrides() {
 	if v := envFirst("logLevel", "LOG_LEVEL"); v != "" {
 		c.Log.Level = v
 	}
+	if v := envFirst("tlsMaxVersion", "TLS_MAX_VERSION", "PANEL_TLS_MAX_VERSION"); v != "" {
+		c.Panel.TLSMaxVersion = v
+	}
 }
 
 func (c *Config) setDefaults() {
@@ -306,6 +326,11 @@ func (c *Config) validate() error {
 			if n.NodeID <= 0 {
 				return fmt.Errorf("nodes[%d].node_id must be positive", i)
 			}
+		}
+		switch strings.ToLower(strings.TrimSpace(c.Panel.TLSMaxVersion)) {
+		case "", "1.3", "tls1.3", "tlsv1.3", "1.2", "tls1.2", "tlsv1.2":
+		default:
+			return fmt.Errorf("panel.tls_max_version must be 1.2 or 1.3, got %q", c.Panel.TLSMaxVersion)
 		}
 	}
 	switch c.Kernel.Type {

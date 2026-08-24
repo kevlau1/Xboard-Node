@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -333,5 +334,21 @@ func TestStringOrArrayDecodeHook_String(t *testing.T) {
 	want := "stop=8\n0=30-30"
 	if string(cfg.PaddingScheme) != want {
 		t.Errorf("got %q, want %q", cfg.PaddingScheme, want)
+	}
+}
+
+func TestNewClient_TLSMaxVersion12(t *testing.T) {
+	client := NewClient(config.PanelConfig{
+		URL:           "https://panel.example.com",
+		Token:         "t",
+		NodeID:        1,
+		TLSMaxVersion: "1.2",
+	})
+	tr, ok := client.httpClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("expected *http.Transport")
+	}
+	if tr.TLSClientConfig == nil || tr.TLSClientConfig.MaxVersion != tls.VersionTLS12 {
+		t.Fatalf("TLS MaxVersion: %+v", tr.TLSClientConfig)
 	}
 }
